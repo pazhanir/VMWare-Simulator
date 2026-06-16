@@ -96,13 +96,17 @@ func main() {
 	// This fires for every host during configure(), allowing us to set
 	// vendor/model/CPU per host based on profiles registered by the
 	// inventory builder.
-	simulator.HostCustomizationFunc = func(hostname string, summary *types.HostHardwareSummary, hardware *types.HostHardwareInfo) {
+	simulator.HostCustomizationFunc = func(hostname string, summary *types.HostHardwareSummary, hardware *types.HostHardwareInfo, runtime *types.HostRuntimeInfo) {
 		profile := inventory.LookupHostProfile(hostname)
 		if profile != nil {
 			profile.Apply(summary, hardware)
+			// Install realistic health sensors (fan, temp, power, voltage,
+			// memory, battery, ...) with the SensorType strings the Site24x7
+			// poller buckets on, so the ESX Hardware dashboard isn't all 0/0.
+			inventory.ApplySensors(runtime, profile)
 		}
 	}
-	log.Println("[hardware] Host customization hook installed for vendor/model diversity")
+	log.Println("[hardware] Host customization hook installed for vendor/model diversity + health sensors")
 
 	err := model.Create()
 	if err != nil {

@@ -30,9 +30,11 @@ var (
 	// created and configured (hostname/UUID assigned). It allows external code
 	// to customize per-host hardware properties such as vendor, model, CPU,
 	// memory, and BIOS info. The function receives pointers to the
-	// HostHardwareSummary (Summary.Hardware) and HostHardwareInfo (Hardware)
-	// along with the hostname, so it can set fields directly.
-	HostCustomizationFunc func(hostname string, summary *types.HostHardwareSummary, hardware *types.HostHardwareInfo)
+	// HostHardwareSummary (Summary.Hardware), HostHardwareInfo (Hardware), and
+	// HostRuntimeInfo (Runtime) along with the hostname, so it can set fields
+	// directly — including health sensors under
+	// Runtime.HealthSystemRuntime.SystemHealthInfo.NumericSensorInfo.
+	HostCustomizationFunc func(hostname string, summary *types.HostHardwareSummary, hardware *types.HostHardwareInfo, runtime *types.HostRuntimeInfo)
 )
 
 type HostSystem struct {
@@ -145,7 +147,7 @@ func (h *HostSystem) configure(ctx *Context, spec types.HostConnectSpec, connect
 
 	// Allow external code to customize hardware properties per host.
 	if HostCustomizationFunc != nil {
-		HostCustomizationFunc(h.Name, h.Summary.Hardware, h.Hardware)
+		HostCustomizationFunc(h.Name, h.Summary.Hardware, h.Hardware, &h.Runtime)
 	}
 
 	// Recalculate QuickStats proportional to actual hardware (which may have
