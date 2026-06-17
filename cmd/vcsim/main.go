@@ -35,6 +35,7 @@ import (
 	_ "github.com/vmware/govmomi/vapi/simulator"
 
 	"github.com/site24x7/vcsim-demo/pkg/api"
+	"github.com/site24x7/vcsim-demo/pkg/correlate"
 	"github.com/site24x7/vcsim-demo/pkg/inventory"
 	"github.com/site24x7/vcsim-demo/pkg/overrides"
 	"github.com/site24x7/vcsim-demo/pkg/scenarios"
@@ -165,6 +166,12 @@ func main() {
 			log.Println("[inventory] Continuing with default vcsim inventory")
 		} else {
 			log.Println("[inventory] Inventory build complete!")
+
+			// Reconcile reported usage bottom-up (VM -> host -> cluster) so the
+			// inventory is internally consistent: host QuickStats reflect the
+			// sum of their VMs, and cluster demand reflects the sum of hosts.
+			headroom := correlate.Reconcile(model.Map())
+			log.Printf("[correlate] Reconciled usage across %d hosts (VM->host->cluster rollup)", len(headroom))
 		}
 	}
 
