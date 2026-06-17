@@ -214,6 +214,49 @@ func (e *Engine) contention(host types.ManagedObjectReference, capCPU, capMem, d
 	return victims
 }
 
+// RestoreHost resets a host and all its VMs back to their baseline load (the
+// clean post-build snapshot), re-applying QuickStats, then rolls the restored
+// values up to the cluster. Used on scenario deactivation so the inventory
+// returns to its idle state without a full restart. Scoped to one host so it
+// does not disturb scenarios still active on other hosts.
+// It returns the refs of the host's VMs (and the host) so the caller can also
+// clear any override-based symptom metrics (cpu.ready, balloon, swap) it set on
+// them — the load-state restore alone does not touch the override registry.
+func (e *Engine) RestoreHost(hostRef types.ManagedObjectReference) []types.ManagedObjectReference {
+	host, ok := e.m.Get(hostRef).(*simulator.HostSystem)
+	if !ok {
+		return nil
+	}
+	var touched []types.ManagedObjectReference
+	for _, vm := range e.vmsOnHost(hostRef) {
+		if base, ok := Baseline(vm.Self); ok {
+			SetState(vm.Self, base)
+			ApplyToVMQuickStats(&vm.Summary.QuickStats, base)
+		}
+		touched = append(touched, vm.Self)
+	}
+	if base, ok := Baseline(hostRef); ok {
+		SetState(hostRef, base)
+		host.Summary.QuickStats.OverallCpuUsage = int32(base.CPUUsageMhz)
+		host.Summary.QuickStats.OverallMemoryUsage = int32(base.MemUsageMB)
+	}
+	touched = append(touched, hostRef)
+	e.rollupCluster(host.Parent)
+	return touched
+}
+
+// RestoreAll resets every host (and its VMs and clusters) to baseline and
+// returns all touched refs so the caller can clear their symptom overrides.
+func (e *Engine) RestoreAll() []types.ManagedObjectReference {
+	var touched []types.ManagedObjectReference
+	for _, ent := range e.m.All("HostSystem") {
+		if h, ok := ent.(*simulator.HostSystem); ok {
+			touched = append(touched, e.RestoreHost(h.Self)...)
+		}
+	}
+	return touched
+}
+
 // rollupCluster re-sums all hosts under a compute resource into its UsageSummary.
 func (e *Engine) rollupCluster(parent *types.ManagedObjectReference) {
 	if parent == nil {

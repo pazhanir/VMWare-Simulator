@@ -28,8 +28,9 @@ const (
 )
 
 var (
-	stateMu sync.RWMutex
-	states  = map[string]LoadState{} // keyed by morKey
+	stateMu  sync.RWMutex
+	states   = map[string]LoadState{} // current load state, keyed by morKey
+	baseline = map[string]LoadState{} // clean post-build snapshot for restore
 )
 
 // morKey matches the override registry's keying ("Type:Value") so we are immune
@@ -58,6 +59,26 @@ func Reset() {
 	stateMu.Lock()
 	defer stateMu.Unlock()
 	states = map[string]LoadState{}
+}
+
+// SnapshotBaseline records the current state of every entity as the clean
+// baseline to restore to when a scenario is deactivated. Called once after
+// Reconcile completes.
+func SnapshotBaseline() {
+	stateMu.Lock()
+	defer stateMu.Unlock()
+	baseline = make(map[string]LoadState, len(states))
+	for k, v := range states {
+		baseline[k] = v
+	}
+}
+
+// Baseline returns the recorded baseline load state for an entity.
+func Baseline(ref types.ManagedObjectReference) (LoadState, bool) {
+	stateMu.RLock()
+	defer stateMu.RUnlock()
+	l, ok := baseline[morKey(ref)]
+	return l, ok
 }
 
 // BaselineMetric returns the load-derived value for a correlated counter, or nil

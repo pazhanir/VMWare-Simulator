@@ -175,6 +175,7 @@ func main() {
 			// inventory is internally consistent: host QuickStats reflect the
 			// sum of their VMs, and cluster demand reflects the sum of hosts.
 			headroom := correlate.Reconcile(model.Map())
+			correlate.SnapshotBaseline() // remember the clean state for scenario restore
 			log.Printf("[correlate] Reconciled usage across %d hosts (VM->host->cluster rollup)", len(headroom))
 		}
 	}

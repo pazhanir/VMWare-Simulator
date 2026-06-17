@@ -166,6 +166,9 @@ func (m *Manager) ClearAll(ctx context.Context) error {
 
 	log.Printf("[scenario] Clearing all %d active scenarios", len(m.active))
 	m.registry.ClearAll()
+	if m.engine != nil {
+		m.engine.RestoreAll() // return the load-state model to baseline too
+	}
 	m.active = make(map[string]*ActiveScenario)
 	return nil
 }
@@ -370,6 +373,24 @@ func (m *Manager) deactivateScenario(ctx context.Context, req ActivateRequest) e
 	// For most scenarios, clearing all overrides on the targets is sufficient.
 	// For state-change scenarios (host disconnect, VM power off), we need to
 	// reverse the action.
+	// Engine-driven CPU/memory scenarios mutate the shared load-state; restore
+	// the affected hosts back to baseline so the whole tree (host QuickStats,
+	// QueryPerf baselines, cluster demand, neighbour VMs) returns to idle.
+	if m.engine != nil {
+		switch req.ID {
+		case "cpu_host_saturation", "mem_host_exhaustion":
+			for _, target := range req.Targets {
+				if ref, err := m.resolveRef(ctx, target); err == nil {
+					// Restore load-state AND clear the symptom overrides
+					// (cpu.ready, balloon, swap) the engine set on neighbour VMs.
+					for _, touched := range m.engine.RestoreHost(ref) {
+						m.registry.ClearMetrics(touched)
+					}
+				}
+			}
+		}
+	}
+
 	switch req.ID {
 	case "host_psod", "net_mgmt_partition":
 		return m.deactivateHostDisconnect(ctx, req)
