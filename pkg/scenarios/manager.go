@@ -167,7 +167,8 @@ func (m *Manager) ClearAll(ctx context.Context) error {
 	log.Printf("[scenario] Clearing all %d active scenarios", len(m.active))
 	m.registry.ClearAll()
 	if m.engine != nil {
-		m.engine.RestoreAll() // return the load-state model to baseline too
+		m.engine.RestoreAll()        // hosts/VMs/clusters back to baseline
+		m.engine.RestoreDatastores() // datastore free-space back to rolled-up baseline
 	}
 	m.active = make(map[string]*ActiveScenario)
 	return nil
@@ -378,16 +379,37 @@ func (m *Manager) deactivateScenario(ctx context.Context, req ActivateRequest) e
 	// QueryPerf baselines, cluster demand, neighbour VMs) returns to idle.
 	if m.engine != nil {
 		switch req.ID {
+		// Host-scoped load scenarios: restore the target host(s).
 		case "cpu_host_saturation", "mem_host_exhaustion":
 			for _, target := range req.Targets {
 				if ref, err := m.resolveRef(ctx, target); err == nil {
-					// Restore load-state AND clear the symptom overrides
-					// (cpu.ready, balloon, swap) the engine set on neighbour VMs.
 					for _, touched := range m.engine.RestoreHost(ref) {
 						m.registry.ClearMetrics(touched)
 					}
 				}
 			}
+		// VM-scoped load scenarios: restore the target VM's host (re-sums the
+		// VM back to baseline and clears any neighbour contention it caused).
+		case "cpu_vm_costop", "mem_vm_leak":
+			for _, target := range req.Targets {
+				if ref, err := m.resolveRef(ctx, target); err == nil {
+					for _, touched := range m.engine.RestoreVMHost(ref) {
+						m.registry.ClearMetrics(touched)
+					}
+				}
+			}
+		// Cluster-scoped load scenarios: restore every host in the cluster.
+		case "cpu_cluster_contention", "host_boot_storm", "cascade_ha_exhaustion":
+			for _, target := range req.Targets {
+				if ref, err := m.resolveRef(ctx, target); err == nil {
+					for _, touched := range m.engine.RestoreCluster(ref) {
+						m.registry.ClearMetrics(touched)
+					}
+				}
+			}
+		// Datastore scenario: recompute free-space from VM disk usage.
+		case "disk_ds_full":
+			m.engine.RestoreDatastores()
 		}
 	}
 

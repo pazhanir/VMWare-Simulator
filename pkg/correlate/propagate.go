@@ -130,6 +130,46 @@ func (e *Engine) SetHostLoad(hostRef types.ManagedObjectReference, cpuFrac, memF
 	return e.contention(hostRef, capCPU, capMem, hostCPU, hostMem)
 }
 
+// ClusterHosts returns the host refs of a cluster (ComputeResource).
+func (e *Engine) ClusterHosts(clusterRef types.ManagedObjectReference) []types.ManagedObjectReference {
+	cc, ok := e.m.Get(clusterRef).(*simulator.ClusterComputeResource)
+	if !ok {
+		return nil
+	}
+	return cc.Host
+}
+
+// SetClusterLoad drives every host in a cluster to the given CPU/mem fraction
+// (each with slight per-host variation so the cluster isn't perfectly uniform),
+// rolls the change up to the cluster, and returns the combined contention
+// victims across all hosts. Used by cluster-wide scenarios.
+func (e *Engine) SetClusterLoad(clusterRef types.ManagedObjectReference, cpuFrac, memFrac float64) []Victim {
+	var victims []Victim
+	for i, hostRef := range e.ClusterHosts(clusterRef) {
+		// +/- a few percent per host for realism (deterministic by index).
+		jitter := float64((i%5))/100.0 - 0.02 // -0.02 .. +0.02
+		cf, mf := cpuFrac, memFrac
+		if cf >= 0 {
+			cf += jitter
+		}
+		if mf >= 0 {
+			mf += jitter
+		}
+		victims = append(victims, e.SetHostLoad(hostRef, cf, mf)...)
+	}
+	return victims
+}
+
+// RestoreCluster resets every host in a cluster (and its VMs) to baseline and
+// returns all touched refs so the caller can clear symptom overrides.
+func (e *Engine) RestoreCluster(clusterRef types.ManagedObjectReference) []types.ManagedObjectReference {
+	var touched []types.ManagedObjectReference
+	for _, hostRef := range e.ClusterHosts(clusterRef) {
+		touched = append(touched, e.RestoreHost(hostRef)...)
+	}
+	return touched
+}
+
 // recomputeHost re-sums a host's VMs into its QuickStats/state, rolls up to the
 // cluster, and returns contention victims.
 func (e *Engine) recomputeHost(host *simulator.HostSystem) []Victim {
@@ -243,6 +283,16 @@ func (e *Engine) RestoreHost(hostRef types.ManagedObjectReference) []types.Manag
 	touched = append(touched, hostRef)
 	e.rollupCluster(host.Parent)
 	return touched
+}
+
+// RestoreVMHost restores the host a VM runs on (and all VMs on that host) to
+// baseline. Used when a VM-scoped load scenario is deactivated.
+func (e *Engine) RestoreVMHost(vmRef types.ManagedObjectReference) []types.ManagedObjectReference {
+	vm, ok := e.m.Get(vmRef).(*simulator.VirtualMachine)
+	if !ok || vm.Runtime.Host == nil {
+		return nil
+	}
+	return e.RestoreHost(*vm.Runtime.Host)
 }
 
 // RestoreAll resets every host (and its VMs and clusters) to baseline and

@@ -61,17 +61,32 @@ func (m *Manager) activateCPUHostSaturation(ctx context.Context, req ActivateReq
 // - CASCADE: All VMs show elevated ready time, resource pools near limits
 func (m *Manager) activateCPUClusterContention(ctx context.Context, req ActivateRequest, expiry time.Time) error {
 	for _, target := range req.Targets {
+		// Correlated path: drive the whole cluster's hosts to high CPU through
+		// the engine. Each host rolls up to the cluster demand, and the engine
+		// returns the contention victims (VMs on every saturated host) so we
+		// apply their CPU-ready symptom.
+		if m.engine != nil {
+			clusterRef, err := m.resolveRef(ctx, target)
+			if err != nil {
+				return err
+			}
+			victims := m.engine.SetClusterLoad(clusterRef, 0.90, -1) // ~90% across the cluster
+			for _, v := range victims {
+				m.setHighCPUReady(v.VM, int(v.CPUReadyPct*200), expiry)
+				m.setHighCPUMetrics(v.VM, 60+int(v.CPUReadyPct/5), expiry)
+			}
+			continue
+		}
+
+		// Legacy fallback.
 		hosts, err := m.findHostsInCluster(ctx, target)
 		if err != nil {
 			return fmt.Errorf("find hosts in cluster %s: %w", target, err)
 		}
-
 		for i, host := range hosts {
 			hostRef := host.Reference()
 			cpuPercent := 82 + (i*3)%18 // 82-99% varied
 			m.setHighCPUMetrics(hostRef, cpuPercent, expiry)
-
-			// CASCADE: VMs on each host
 			vms, _ := m.findVMsOnHost(ctx, host.InventoryPath)
 			for _, vm := range vms {
 				vmRef := vm.Reference()
@@ -89,7 +104,7 @@ func (m *Manager) activateCPUVMCoStop(ctx context.Context, req ActivateRequest, 
 		if err != nil {
 			return err
 		}
-		// Co-stop metric
+		// Co-stop metric (SMP scheduling delay — not a load-model dimension).
 		m.registry.SetMetric(ref, overrides.MetricOverride{
 			CounterID: 13, // cpu.costop.summation
 			Values:    generateHighValues(12000, 25),
@@ -97,12 +112,20 @@ func (m *Manager) activateCPUVMCoStop(ctx context.Context, req ActivateRequest, 
 		})
 		// Ready time also elevated
 		m.setHighCPUReady(ref, 10000, expiry)
-		// CPU usage erratic (swinging wildly)
-		m.registry.SetMetric(ref, overrides.MetricOverride{
-			CounterID: 2, // cpu.usage.average
-			Values:    []int64{9500, 2000, 9800, 1500, 9200, 3000, 9900, 1000, 8500, 4000, 9700, 2500},
-			ExpiresAt: expiry,
-		})
+
+		// Correlated path: drive the VM's own CPU high through the engine so it
+		// rolls up into its host (and cluster). A single VM rarely saturates a
+		// host, so this usually won't create neighbour contention — which is
+		// realistic for a co-stop on one SMP VM.
+		if m.engine != nil {
+			m.engine.SetVMLoad(ref, 0.95, -1)
+		} else {
+			m.registry.SetMetric(ref, overrides.MetricOverride{
+				CounterID: 2, // cpu.usage.average
+				Values:    []int64{9500, 2000, 9800, 1500, 9200, 3000, 9900, 1000, 8500, 4000, 9700, 2500},
+				ExpiresAt: expiry,
+			})
+		}
 	}
 	return nil
 }
@@ -202,23 +225,36 @@ func (m *Manager) activateMemVMLeak(ctx context.Context, req ActivateRequest, ex
 		if err != nil {
 			return err
 		}
-		// Consumed memory growing over time
+		// Correlated path: drive the VM's memory to near-full through the engine
+		// so consumed/active/usage move together and roll up into the host's
+		// memory usage (and the cluster). If this VM's growth pushes the host
+		// over its RAM, the engine will surface balloon/swap on neighbours.
+		if m.engine != nil {
+			victims := m.engine.SetVMLoad(ref, -1, 0.97)
+			for _, v := range victims {
+				if v.BalloonMB > 0 {
+					m.registry.SetMetric(v.VM, overrides.MetricOverride{
+						CounterID: 65, Values: generateHighValues(v.BalloonMB*1024, 10), ExpiresAt: expiry,
+					})
+				}
+				if v.SwappedMB > 0 {
+					m.registry.SetMetric(v.VM, overrides.MetricOverride{
+						CounterID: 35, Values: generateHighValues(v.SwappedMB*1024, 15), ExpiresAt: expiry,
+					})
+				}
+			}
+			continue
+		}
+
+		// Legacy fallback: consumed/active/usage growing over time via overrides.
 		m.registry.SetMetric(ref, overrides.MetricOverride{
-			CounterID: 25,                                       // mem.consumed.average
-			Values:    generateIncrementingValues(500*1024, 12), // Growing by 500MB per interval
-			ExpiresAt: expiry,
+			CounterID: 25, Values: generateIncrementingValues(500*1024, 12), ExpiresAt: expiry,
 		})
-		// Active memory tracking consumed
 		m.registry.SetMetric(ref, overrides.MetricOverride{
-			CounterID: 26, // mem.active.average
-			Values:    generateIncrementingValues(480*1024, 12),
-			ExpiresAt: expiry,
+			CounterID: 26, Values: generateIncrementingValues(480*1024, 12), ExpiresAt: expiry,
 		})
-		// Usage climbing
 		m.registry.SetMetric(ref, overrides.MetricOverride{
-			CounterID: 24, // mem.usage.average
-			Values:    []int64{5000, 5500, 6000, 6500, 7000, 7500, 8000, 8500, 9000, 9200, 9500, 9800},
-			ExpiresAt: expiry,
+			CounterID: 24, Values: []int64{5000, 5500, 6000, 6500, 7000, 7500, 8000, 8500, 9000, 9200, 9500, 9800}, ExpiresAt: expiry,
 		})
 	}
 	return nil
@@ -275,23 +311,24 @@ func (m *Manager) activateDiskDSFull(ctx context.Context, req ActivateRequest, e
 			return err
 		}
 
-		// Set datastore free space very low
+		// Correlated path: drive the datastore's used fraction against its REAL
+		// capacity (so the shown numbers stay self-consistent) instead of
+		// faking a 4TB property. RestoreDatastores reverts to the rolled-up
+		// baseline on deactivation.
+		if m.engine != nil {
+			m.engine.SetDatastoreUsage(ref, float64(100-freePercent)/100.0)
+			continue
+		}
+
+		// Legacy fallback: property override on a hardcoded capacity.
 		totalBytes := int64(4096) * 1024 * 1024 * 1024 // 4TB
 		freeBytes := totalBytes * int64(freePercent) / 100
 		m.registry.SetProperty(ref, overrides.PropertyOverride{
-			Property:  "summary.freeSpace",
-			Value:     freeBytes,
-			ExpiresAt: expiry,
+			Property: "summary.freeSpace", Value: freeBytes, ExpiresAt: expiry,
 		})
 		m.registry.SetProperty(ref, overrides.PropertyOverride{
-			Property:  "summary.capacity",
-			Value:     totalBytes,
-			ExpiresAt: expiry,
+			Property: "summary.capacity", Value: totalBytes, ExpiresAt: expiry,
 		})
-
-		// CASCADE: Suspend some VMs on this datastore
-		// (In real implementation, we'd find VMs by datastore association)
-		// For now, we set the property to indicate the datastore is nearly full
 	}
 	return nil
 }
@@ -556,12 +593,18 @@ func (m *Manager) activateHostBootStorm(ctx context.Context, req ActivateRequest
 			disconnected++
 		}
 
-		// CASCADE: Remaining hosts get overloaded
+		// CASCADE: Remaining hosts get overloaded (VMs from the down hosts pile
+		// onto the survivors). Drive their CPU+mem through the engine so the
+		// overload rolls up to the cluster and surfaces neighbour contention.
 		for i := hostCount; i < len(hosts); i++ {
 			hostRef := hosts[i].Reference()
 			overloadPercent := 85 + (i%3)*5 // 85-95%
-			m.setHighCPUMetrics(hostRef, overloadPercent, expiry)
-			m.setHighMemMetrics(hostRef, overloadPercent-5, 2048, 1000, expiry)
+			if m.engine != nil {
+				m.applyHostOverload(hostRef, overloadPercent, overloadPercent-5, expiry)
+			} else {
+				m.setHighCPUMetrics(hostRef, overloadPercent, expiry)
+				m.setHighMemMetrics(hostRef, overloadPercent-5, 2048, 1000, expiry)
+			}
 		}
 	}
 	return nil
@@ -748,11 +791,16 @@ func (m *Manager) activateCascadeHAExhaustion(ctx context.Context, req ActivateR
 			_, _ = task1.WaitForResult(ctx, nil)
 		}
 
-		// Step 2: Survivors overloaded
+		// Step 2: Survivors overloaded (engine-driven so it rolls up to the
+		// cluster and surfaces neighbour contention on the survivors).
 		for i := 1; i < len(hosts); i++ {
 			hostRef := hosts[i].Reference()
-			m.setHighCPUMetrics(hostRef, 88+i*2, expiry)
-			m.setHighMemMetrics(hostRef, 85+i*2, 2048, 500, expiry)
+			if m.engine != nil {
+				m.applyHostOverload(hostRef, 88+i*2, 85+i*2, expiry)
+			} else {
+				m.setHighCPUMetrics(hostRef, 88+i*2, expiry)
+				m.setHighMemMetrics(hostRef, 85+i*2, 2048, 500, expiry)
+			}
 		}
 
 		// Step 3: Second host fails (overload)
@@ -779,11 +827,33 @@ func (m *Manager) activateCascadeHAExhaustion(ctx context.Context, req ActivateR
 		// Step 4: Remaining hosts at critical levels
 		for i := 2; i < len(hosts); i++ {
 			hostRef := hosts[i].Reference()
-			m.setHighCPUMetrics(hostRef, 96+i%4, expiry)
-			m.setHighMemMetrics(hostRef, 97, 4096, 3000, expiry)
+			if m.engine != nil {
+				m.applyHostOverload(hostRef, 96+i%4, 97, expiry)
+			} else {
+				m.setHighCPUMetrics(hostRef, 96+i%4, expiry)
+				m.setHighMemMetrics(hostRef, 97, 4096, 3000, expiry)
+			}
 		}
 	}
 	return nil
+}
+
+// applyHostOverload drives a host's CPU+mem through the engine and applies the
+// resulting contention symptoms (cpu.ready, balloon, swap) to its victim VMs.
+// Shared by the boot-storm / HA-cascade survivor-overload paths.
+func (m *Manager) applyHostOverload(hostRef types.ManagedObjectReference, cpuPct, memPct int, expiry time.Time) {
+	victims := m.engine.SetHostLoad(hostRef, float64(cpuPct)/100.0, float64(memPct)/100.0)
+	for _, v := range victims {
+		if v.CPUReadyPct > 0 {
+			m.setHighCPUReady(v.VM, int(v.CPUReadyPct*200), expiry)
+		}
+		if v.BalloonMB > 0 {
+			m.registry.SetMetric(v.VM, overrides.MetricOverride{CounterID: 65, Values: generateHighValues(v.BalloonMB*1024, 10), ExpiresAt: expiry})
+		}
+		if v.SwappedMB > 0 {
+			m.registry.SetMetric(v.VM, overrides.MetricOverride{CounterID: 35, Values: generateHighValues(v.SwappedMB*1024, 15), ExpiresAt: expiry})
+		}
+	}
 }
 
 // Scenario 29: Network Partition (Split Brain)

@@ -89,6 +89,34 @@ func vmDiskCapacityBytes(vm *simulator.VirtualMachine) int64 {
 	return total
 }
 
+// SetDatastoreUsage forces a datastore's used fraction (0-1 of capacity),
+// updating FreeSpace + Info. Used by the disk_ds_full scenario so the datastore
+// view shows realistic exhaustion. Returns true if the datastore was found.
+func (e *Engine) SetDatastoreUsage(dsRef types.ManagedObjectReference, usedFrac float64) bool {
+	ds, ok := e.m.Get(dsRef).(*simulator.Datastore)
+	if !ok {
+		return false
+	}
+	if usedFrac < 0 {
+		usedFrac = 0
+	}
+	if usedFrac > 1 {
+		usedFrac = 1
+	}
+	free := int64(float64(ds.Summary.Capacity) * (1 - usedFrac))
+	ds.Summary.FreeSpace = free
+	if info := ds.Info.GetDatastoreInfo(); info != nil {
+		info.FreeSpace = free
+	}
+	return true
+}
+
+// RestoreDatastores recomputes every datastore's free-space from VM disk usage,
+// reverting any scenario-forced exhaustion back to the correlated baseline.
+func (e *Engine) RestoreDatastores() {
+	rollupStorage(e.m)
+}
+
 // rollupResourcePools sums each pool's member-VM CPU/memory usage into its
 // Runtime usage figures so the pool reflects what its VMs are actually using.
 func rollupResourcePools(m *simulator.Registry) {
