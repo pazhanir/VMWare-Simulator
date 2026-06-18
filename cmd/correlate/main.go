@@ -46,7 +46,21 @@ func main() {
 		v, _ := m.CreateContainerView(ctx, c.ServiceContent.RootFolder, []string{"VirtualMachine"}, true)
 		defer v.Destroy(ctx)
 		var l []mo.VirtualMachine
-		v.Retrieve(ctx, []string{"VirtualMachine"}, []string{"name", "runtime", "summary"}, &l)
+		v.Retrieve(ctx, []string{"VirtualMachine"}, []string{"name", "runtime", "summary", "storage"}, &l)
+		return l
+	}
+	getDatastores := func() []mo.Datastore {
+		v, _ := m.CreateContainerView(ctx, c.ServiceContent.RootFolder, []string{"Datastore"}, true)
+		defer v.Destroy(ctx)
+		var l []mo.Datastore
+		v.Retrieve(ctx, []string{"Datastore"}, []string{"name", "summary", "vm"}, &l)
+		return l
+	}
+	getPools := func() []mo.ResourcePool {
+		v, _ := m.CreateContainerView(ctx, c.ServiceContent.RootFolder, []string{"ResourcePool"}, true)
+		defer v.Destroy(ctx)
+		var l []mo.ResourcePool
+		v.Retrieve(ctx, []string{"ResourcePool"}, []string{"name", "runtime", "vm"}, &l)
 		return l
 	}
 	getClusters := func() []mo.ClusterComputeResource {
@@ -152,6 +166,47 @@ func main() {
 			fails++
 		}
 		fmt.Printf("%-14s QuickStats=%-7d perf.usagemhz=%-7d  %s\n", h.Name, qs, perf, status)
+	}
+
+	// Phase 4a: datastore FreeSpace reflects VM consumption — it must be less
+	// than capacity (something used) and non-negative, and it should scale with
+	// the number of VMs on the datastore.
+	fmt.Println("\n======== DATASTORE free-space reflects VM usage ========")
+	for _, ds := range getDatastores() {
+		used := ds.Summary.Capacity - ds.Summary.FreeSpace
+		status := "OK"
+		if ds.Summary.FreeSpace < 0 || ds.Summary.FreeSpace > ds.Summary.Capacity {
+			status = "FAIL (out of range)"
+			fails++
+		} else if len(ds.Vm) > 0 && used <= 0 {
+			status = "FAIL (VMs present but 0 used)"
+			fails++
+		}
+		fmt.Printf("%-22s vms=%-3d capGB=%-7d usedGB=%-6d freeGB=%-7d  %s\n",
+			ds.Name, len(ds.Vm), ds.Summary.Capacity/(1<<30), used/(1<<30),
+			ds.Summary.FreeSpace/(1<<30), status)
+	}
+
+	// Phase 4b: resource-pool usage > 0 when it has VMs (rollup populated).
+	fmt.Println("\n======== RESOURCE POOL usage (Σ member VMs) ========")
+	pools := getPools()
+	shown := 0
+	for _, rp := range pools {
+		if len(rp.Vm) == 0 {
+			continue
+		}
+		cpu := rp.Runtime.Cpu.OverallUsage
+		mem := rp.Runtime.Memory.OverallUsage
+		status := "OK"
+		if cpu <= 0 || mem <= 0 {
+			status = "FAIL (no usage rolled up)"
+			fails++
+		}
+		if shown < 8 {
+			fmt.Printf("%-20s vms=%-3d cpuUsage=%-8d MHz  memUsage=%-6d MB  %s\n",
+				rp.Name, len(rp.Vm), cpu, mem/(1<<20), status)
+			shown++
+		}
 	}
 
 	fmt.Printf("\n%d invariant violation(s)\n", fails)

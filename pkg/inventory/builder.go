@@ -6,6 +6,7 @@ package inventory
 import (
 	"context"
 	"fmt"
+	"hash/fnv"
 	"log"
 	"net/url"
 	"os"
@@ -674,8 +675,16 @@ func (b *Builder) createVM(ctx context.Context, pool *object.ResourcePool, name 
 		return err
 	}
 
-	// Power on the VM
 	vm := object.NewVirtualMachine(b.client.Client, result.Result.(types.ManagedObjectReference))
+
+	// Attach a deterministically-sized virtual disk so the VM has real
+	// committed storage. Without a disk, vcsim reports committed=0 and the
+	// datastore free-space correlation has nothing to sum.
+	if err := b.attachDisk(ctx, vm, name, dsName); err != nil {
+		log.Printf("[inventory] WARNING: attach disk to %s: %v", name, err)
+	}
+
+	// Power on the VM
 	powerTask, err := vm.PowerOn(ctx)
 	if err != nil {
 		return nil // Non-fatal, VM created but not powered on
@@ -683,6 +692,49 @@ func (b *Builder) createVM(ctx context.Context, pool *object.ResourcePool, name 
 	_, _ = powerTask.WaitForResult(ctx, nil)
 
 	return nil
+}
+
+// attachDisk adds a single thin-provisioned virtual disk to the VM, sized
+// deterministically from the VM name (40-160 GB), so the inventory has varied,
+// reproducible committed storage for datastore-usage correlation.
+func (b *Builder) attachDisk(ctx context.Context, vm *object.VirtualMachine, name, dsName string) error {
+	devices, err := vm.Device(ctx)
+	if err != nil {
+		return err
+	}
+
+	ds, err := b.finder.Datastore(ctx, dsName)
+	if err != nil {
+		return err
+	}
+
+	// The default vcsim VM has only IDE/PCI controllers; add a SCSI controller
+	// to host the disk if one isn't already present.
+	controller, err := devices.FindDiskController("scsi")
+	if err != nil {
+		scsi, cerr := devices.CreateSCSIController("pvscsi")
+		if cerr != nil {
+			return cerr
+		}
+		if aerr := vm.AddDevice(ctx, scsi); aerr != nil {
+			return aerr
+		}
+		if devices, err = vm.Device(ctx); err != nil {
+			return err
+		}
+		if controller, err = devices.FindDiskController("scsi"); err != nil {
+			return err
+		}
+	}
+
+	disk := devices.CreateDisk(controller, ds.Reference(), "")
+	// Deterministic size: 40-160 GB based on the VM name.
+	h := fnv.New32a()
+	_, _ = h.Write([]byte(name + ":disk"))
+	gb := int64(40 + h.Sum32()%120)
+	disk.CapacityInKB = gb * 1024 * 1024
+
+	return vm.AddDevice(ctx, disk)
 }
 
 // Close releases the builder's client connection.

@@ -153,5 +153,10 @@ func Reconcile(m *simulator.Registry) map[types.ManagedObjectReference]LoadState
 		SetState(cc.Self, *ca) // record for QueryPerf baseline derivation
 	}
 
+	// Phase 4: datastore free-space = capacity - Σ committed VM disk, and
+	// resource-pool runtime usage = Σ member-VM CPU/memory.
+	rollupStorage(m)
+	rollupResourcePools(m)
+
 	return headroom
 }
